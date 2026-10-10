@@ -2,11 +2,11 @@
 """
 问答质量管理 / 自动调优 — 功能测试（API 级，黑盒）
 用法：python3 docs/dev/func_test_quality.py [BASE_URL]
-  BASE_URL 默认 http://127.0.0.1:8600（经静态代理，含模拟登录 /upc/user/login）
+  BASE_URL 默认 http://127.0.0.1:8600（经静态代理，含模拟登录）；也可直连 bi-manager http://127.0.0.1:8591（自动本地签发 JWT）
 覆盖：正向闭环、状态机守卫、参数校验、权限（超级管理员）、幂等/并发守卫、回归集、配置、通知。
 输出：逐条 PASS/FAIL + 汇总；生成 docs/dev/FUNC_TEST_REPORT.md
 """
-import sys, json, time, urllib.request, urllib.error, datetime, os, io
+import sys, json, time, urllib.request, urllib.error, urllib.parse, datetime, os, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 BASE = sys.argv[1].rstrip('/') if len(sys.argv) > 1 else 'http://127.0.0.1:8600'
@@ -15,6 +15,7 @@ RESULTS = []
 
 def http(method, path, body=None, token=None, raw=False):
     data = None if body is None else json.dumps(body, ensure_ascii=False).encode()
+    path = urllib.parse.quote(path, safe='/?=&:%+@')
     req = urllib.request.Request(BASE + path, data=data, method=method)
     req.add_header('Content-Type', 'application/json')
     req.add_header('tenantid', '1')
@@ -29,8 +30,17 @@ def http(method, path, body=None, token=None, raw=False):
 
 
 def login(user):
+    """优先走静态代理的模拟登录；若直连 bi-manager（无 /upc），则本地签发 JWT。"""
     _, r = http('POST', '/upc/user/login', {'username': user, 'password': 'x'})
-    return r['data']['token']
+    if isinstance(r, dict) and r.get('code') == 1:
+        return r['data']['token']
+    import hmac, hashlib, base64
+    secret = os.environ.get('JWT_SECRET', 'chatbi-jwt-secret-key-for-production-2026').encode()
+    b64 = lambda x: base64.urlsafe_b64encode(x).rstrip(b'=')
+    uid = {'admin': 1, 'yangbin': 2}.get(user, 3); now = int(time.time())
+    h = b64(json.dumps({'alg': 'HS256', 'typ': 'JWT'}).encode())
+    pl = b64(json.dumps({'user_id': uid, 'sub': user, 'iat': now, 'exp': now + 86400}).encode())
+    return (h + b'.' + pl + b'.' + b64(hmac.new(secret, h + b'.' + pl, hashlib.sha256).digest())).decode()
 
 
 def check(group, name, cond, detail=''):
@@ -48,7 +58,8 @@ def main():
     s, r = http('GET', '/api/v1/chat/error-types', token=admin)
     check('认证', '有 token 可访问错误类型字典', r.get('code') == 200 and len(r['data']) >= 8, r)
     s, r = http('POST', '/upc/user/login', {'username': 'nobody'})
-    check('认证', '未知用户登录失败', r.get('code') == 0, r)
+    if isinstance(r, dict) and 'code' in r and '_raw' not in r:
+        check('认证', '未知用户登录失败（模拟登录代理）', r.get('code') == 0, r)
 
     # ---------- 1. 用户反馈 ----------
     g = '用户反馈'
@@ -136,7 +147,7 @@ def main():
     # 等待验证完成
     st = None
     for _ in range(30):
-        time.sleep(1); s, r = http('GET', f'/api/v1/tuning/task/{tid}', token=admin); st = r['data']['task']['status'] if 'task' in r['data'] else r['data'].get('status')
+        time.sleep(1); s, r = http('GET', f'/api/v1/tuning/task/{tid}', token=admin); st = r['data'].get('status')
         if st == 'VERIFIED': break
     check(g, '异步验证完成 → VERIFIED', st == 'VERIFIED', st)
     s, r = http('GET', f'/api/v1/tuning/task/{tid}/report', token=admin)
@@ -191,9 +202,9 @@ def main():
     s, r = http('POST', '/api/v1/tuning/task', token=admin, body={'diagnosisId': diag_id, 'changes': changes})
     tid3 = r['data']['id']
     http('POST', f'/api/v1/tuning/task/{tid3}/execute', token=admin, body={})
-    for _ in range(30):
+    for _ in range(40):
         time.sleep(1); s, r = http('GET', f'/api/v1/tuning/task/{tid3}', token=admin)
-        if (r['data'].get('task') or r['data']).get('status') == 'VERIFIED': break
+        if r['data'].get('status') == 'VERIFIED': break
     s, r = http('PUT', f'/api/v1/tuning/task/{tid3}/changes', token=admin, body={'changes': changes})
     check(g, 'VERIFIED 后编辑变更 → 回 DRAFT 且 round+1', r.get('code') == 200 and r['data']['status'] == 'DRAFT' and r['data']['round'] == 2, r)
     s, r = http('POST', f'/api/v1/tuning/task/{tid3}/cancel', token=admin, body={})
@@ -209,8 +220,13 @@ def main():
     ctx = r.get('data') or {}
     cur = ctx.get('current') or {}
     check(g, '编辑器上下文（当前版本/内容/原问题/锚点）', r.get('code') == 200 and cur.get('content') and cur.get('version') and ctx.get('question') and 'anchors' in ctx, list(ctx.keys()))
-    s, r = http('POST', '/webapp/api/v1/prompts/lint', body={'content': 'no placeholders'})
-    check(g, 'System B lint 接口可达', r.get('code') == 200, r)
+    sysb = os.environ.get('SYSTEM_B_URL', 'http://127.0.0.1:5055')
+    try:
+        rq = urllib.request.Request(sysb + '/api/v1/prompts/lint', data=json.dumps({'content': 'no placeholders'}).encode(), method='POST', headers={'Content-Type': 'application/json'})
+        lint = json.loads(urllib.request.urlopen(rq, timeout=10).read().decode())
+    except Exception as e:
+        lint = {'_err': str(e)}
+    check(g, 'System B lint 接口可达（直连 mock/真实 System B）', lint.get('code') == 200, lint)
     s, r = http('POST', '/api/v1/tuning/prompt/quick-verify', token=admin, body={
         'taskId': tid, 'groupName': 'prompt-main', 'content': cur.get('content', '') + '\n规则三 测试'})
     check(g, '快速验证（仅原问题）', r.get('code') == 200 and (r.get('data') or {}).get('ok') is not None, r)

@@ -361,8 +361,21 @@ public class TuningServiceImpl implements TuningService {
             base = new JSONObject();
         }
         JSONObject draft = applier.buildDraftMeta(base, changes, t.getAiBodyCode());
-        verifyRunner.run(t.getId(), r.getId(), draft.getJSONObject("meta"),
-                toStrMap(draft.getJSONObject("prompt_overrides")), cfg, UserThreadLocal.get());
+        final Long taskId = t.getId(), reportId = r.getId();
+        final JSONObject meta = draft.getJSONObject("meta");
+        final Map<String, String> overrides = toStrMap(draft.getJSONObject("prompt_overrides"));
+        final com.common.models.SaasUser user = UserThreadLocal.get();
+        // 必须在当前事务提交后再启动异步验证：否则 mock/快速下游可能在事务提交前就把任务写成 VERIFIED，
+        // 随后本事务提交会用过期的 VERIFYING 覆盖它（任务卡死在 VERIFYING）。
+        Runnable start = () -> verifyRunner.run(taskId, reportId, meta, overrides, cfg, user);
+        if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()) {
+            org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                    new org.springframework.transaction.support.TransactionSynchronization() {
+                        @Override public void afterCommit() { start.run(); }
+                    });
+        } else {
+            start.run();
+        }
         return t;
     }
 
